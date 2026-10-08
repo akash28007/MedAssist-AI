@@ -1,0 +1,204 @@
+"""
+LLM Chain module for MedAssist AI.
+
+Constructs the prompt with retrieved context and conversation history,
+sends it to the LLM, and returns the generated response.
+Includes retry logic with exponential backoff for LLM call resilience.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import List, Optional
+
+from langchain.schema import HumanMessage, SystemMessage
+
+from config import OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, get_system_prompt
+from retriever import MedAssistRetriever, RetrievedChunk
+
+logger = logging.getLogger(__name__)
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.0  # seconds
+LLM_TIMEOUT = 30  # seconds
+
+
+class LLMCallError(Exception):
+    """Raised when all LLM retry attempts are exhausted."""
+
+
+class MedAssistChain:
+    """Orchestrates the RAG query pipeline: retrieve → prompt → LLM → response."""
+
+    def __init__(self):
+        self.retriever = MedAssistRetriever()
+
+        if GEMINI_API_KEY:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            self.llm = ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash-latest",
+                temperature=0.3,
+                google_api_key=GEMINI_API_KEY,
+                max_output_tokens=1024,
+                timeout=LLM_TIMEOUT,
+            )
+            print("🤖 Using Google Gemini (gemini-1.5-flash-latest)")
+        elif ANTHROPIC_API_KEY:
+            from langchain_anthropic import ChatAnthropic
+            self.llm = ChatAnthropic(
+                model="claude-3-5-haiku-20241022",
+                temperature=0.3,
+                api_key=ANTHROPIC_API_KEY,
+                max_tokens=1024,
+                timeout=LLM_TIMEOUT,
+            )
+            print("🤖 Using Anthropic Claude (claude-3-5-haiku)")
+        else:
+            from langchain_openai import ChatOpenAI
+            self.llm = ChatOpenAI(
+                model="gpt-4o-mini",
+                temperature=0.3,
+                api_key=OPENAI_API_KEY,
+                max_tokens=1024,
+                timeout=LLM_TIMEOUT,
+            )
+            print("🤖 Using OpenAI GPT-4o Mini")
+
+        self.system_prompt_template = get_system_prompt()
+
+    def _invoke_with_retry(self, messages: list) -> str:
+        """
+        Invoke the LLM with retry logic and exponential backoff.
+
+        Args:
+            messages: List of LangChain message objects
+
+        Returns:
+            The LLM response content string
+
+        Raises:
+            LLMCallError: If all retry attempts fail
+        """
+        last_exception = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = self.llm.invoke(messages)
+                return response.content
+            except Exception as e:
+                last_exception = e
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        "LLM call failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                        attempt, MAX_RETRIES, str(e), delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        "LLM call failed after %d attempts: %s",
+                        MAX_RETRIES, str(e),
+                    )
+
+        raise LLMCallError(
+            f"LLM call failed after {MAX_RETRIES} attempts: {last_exception}"
+        )
+
+    def build_prompt(
+        self,
+        question: str,
+        context: str,
+        chat_history: Optional[List[dict]] = None,
+    ) -> list:
+        """
+        Build the message list for the LLM.
+
+        Args:
+            question: The user's current question
+            context: Formatted context from retrieved documents
+            chat_history: List of previous messages [{"role": "user"|"assistant", "content": "..."}]
+
+        Returns:
+            List of LangChain message objects
+        """
+        # Format chat history
+        history_str = ""
+        if chat_history:
+            for msg in chat_history[-6:]:  # Keep last 6 messages for context
+                role = "Patient" if msg["role"] == "user" else "MedAssist"
+                history_str += f"{role}: {msg['content']}\n"
+
+        # Fill the system prompt template
+        system_content = self.system_prompt_template.format(
+            context=context,
+            chat_history=history_str or "No previous conversation.",
+            question=question,
+        )
+
+        messages = [
+            SystemMessage(content=system_content),
+            HumanMessage(content=question),
+        ]
+
+        return messages
+
+    def query(
+        self,
+        question: str,
+        chat_history: Optional[List[dict]] = None,
+    ) -> dict:
+        """
+        Run the full RAG pipeline for a user question.
+
+        Args:
+            question: The user's question
+            chat_history: Previous conversation messages
+
+        Returns:
+            Dict with answer, sources, and retrieved chunks info
+        """
+        # Step 1: Retrieve relevant chunks
+        chunks = self.retriever.retrieve(question)
+
+        # Step 2: Format context
+        context = self.retriever.format_context(chunks)
+
+        # Step 3: Build prompt
+        messages = self.build_prompt(question, context, chat_history)
+
+        # Step 4: Get LLM response with retry
+        answer = self._invoke_with_retry(messages)
+
+        # Step 5: Extract source citations
+        sources = self._extract_sources(chunks)
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "chunks_retrieved": len(chunks),
+            "relevance_scores": [c.relevance_score for c in chunks],
+        }
+
+    def _extract_sources(self, chunks: List[RetrievedChunk]) -> List[dict]:
+        """Extract unique source documents from retrieved chunks."""
+        seen = set()
+        sources = []
+        for chunk in chunks:
+            source_key = f"{chunk.source}_{chunk.page}"
+            if source_key not in seen:
+                seen.add(source_key)
+                source_name = (
+                    chunk.source.split("/")[-1]
+                    if "/" in chunk.source
+                    else chunk.source
+                )
+                sources.append(
+                    {
+                        "document": source_name,
+                        "page": chunk.page + 1,
+                        "relevance": chunk.relevance_score,
+                    }
+                )
+        return sources
